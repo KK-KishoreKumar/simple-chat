@@ -11,12 +11,36 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
-#define PORT         "9034"
+#define PORT "9034"
+#define MSGLEN(msg) (strlen(msg) + 1)
 
-/** Types **/
 struct user_t;
 struct room_t;
 
+struct user_t *new_user(int fd);
+
+int add_user(struct room_t *room, struct user_t *user);
+int remove_user(struct room_t *room, int fd);
+
+int  accept_con(int fd);
+int  close_con(struct user_t *user, int n);
+int  get_serv_socket(void);
+void *get_in_addr(struct sockaddr *sa);
+
+int send_to_room(struct user_t *user, const char *msg);
+int send_msg(const struct user_t *receiver, const struct user_t *sender,
+             const char *buf, int flags);
+
+int command_welcome(const struct user_t *user);
+int command_list(const struct user_t *user);
+int command_help(const struct user_t *user);
+int command_nick(struct user_t *user, const char *newnick);
+int command_room(struct user_t *user, const char *newroom);
+int handle_command(struct user_t *user, char *msg);
+int handle_message(struct user_t *user, char *msg);
+
+
+/** Types **/
 struct user_t {
     int  fd;
 
@@ -34,15 +58,23 @@ struct room_t {
 
 /** Globals **/
 enum {
-    MAXDATASIZE  = 2048,
+    MAXDATASIZE  = 4096,
 
-    NROOMS       = 5,
+    NROOMS       = 4,
     ROOMUSERS    = 8,
-    MAXUSERS     = NROOMS * MAXUSERS + 1, // +1 for listener
-
-    SERVROOMI    = 0,                     // server room index
-    USERROOMI    = 1                      // user room index
+    MAXUSERS     = NROOMS * ROOMUSERS + 1 // +1 for listener
 };
+
+const char *room_names[NROOMS] = {
+    "General",
+    "Holywars",
+    "Games",
+    "Questions"
+};
+
+static struct room_t rooms[NROOMS]; // rooms for users
+static struct room_t serv_room;     // room for handle all users
+static struct user_t *listener;     // server is an user too
 
 /* Commands */
 enum {
@@ -62,10 +94,6 @@ const char *commands[] = {
     "!list",
     "!help"
 };
-
-static struct room_t rooms[NROOMS]; // rooms for users
-static struct user_t *listener;     // server is an user too
-static struct room_t *serv_room;    // room for handling all users
 
 /** Functions **/
 struct user_t *new_user(int fd)
@@ -109,13 +137,17 @@ int remove_user(struct room_t *room, int fd)
     return -1; // that room has no fd in it
 }
 
-void *get_in_addr(struct sockaddr *sa)
+int change_room(struct room_t *newroom, struct user_t *user)
 {
-    if (sa->sa_family == AF_INET) {
-        return &(((struct sockaddr_in *) sa)->sin_addr);
-    }
+    int rv = 0;
+    struct room_t *tmp = (user->room == NULL) ? &serv_room : user->room;
+    if (tmp != &serv_room)
+        remove_user(user->room, user->fd);
 
-    return &(((struct sockaddr_in6 *) sa)->sin6_addr);
+    if ((rv = add_user(newroom, user)) == -1)
+        add_user(tmp, user);
+
+    return rv;
 }
 
 int accept_con(int fd)
@@ -124,6 +156,7 @@ int accept_con(int fd)
     struct sockaddr_storage remoteaddr; // client address
     socklen_t addrlen;
     char remoteIP[INET6_ADDRSTRLEN];
+    struct user_t *p;
 
     addrlen = sizeof(remoteaddr);
     newfd   = accept(fd,
@@ -132,7 +165,7 @@ int accept_con(int fd)
 
     if (newfd == -1)
         perror("accept");
-    else
+    else {
         printf("selectserver: new connection from %s on "
            "socket %d\n",
            inet_ntop(remoteaddr.ss_family,
@@ -140,28 +173,33 @@ int accept_con(int fd)
                      remoteIP, INET6_ADDRSTRLEN),
            newfd);
 
+        p = new_user(newfd);
+        add_user(&serv_room, p);
+        command_welcome(p);
+    }
+
     return newfd;
 }
 
 int close_con(struct user_t *user, int n)
 {
-    if (n == 0)
+    if (n == 0) {
         printf("chatserver: socket %d hung up\n", user->fd);
-    else
+    } else {
         perror("recv");
+        return 1;
+    }
 
-    if (user->room != serv_room) // if user was in a custom room
+    if (user->room != &serv_room) // if user was in a custom room
         remove_user(user->room, user->fd);
 
-    remove_user(serv_room, user->fd);
+    remove_user(&serv_room, user->fd);
     close(user->fd);
     free(user);
-    FD_CLR(user->fd, &master); // remove from master set
 
     return 0;
 }
 
-// returns prepared for accept() server socket
 int get_serv_socket(void)
 {
     int sockfd;
@@ -211,18 +249,103 @@ int get_serv_socket(void)
     return sockfd;
 }
 
-/* Commands */
-int command_welcome(struct user_t *user)
+void *get_in_addr(struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET) {
+        return &(((struct sockaddr_in *) sa)->sin_addr);
+    }
+
+    return &(((struct sockaddr_in6 *) sa)->sin6_addr);
+}
+
+int send_to_room(struct user_t *user, const char *msg)
+{
+    for (int i = 0; i < user->room->top; ++i) {
+        if (send_msg(user->room->users[i], user, msg, 0) == -1)
+            perror("send");
+    }
+
+    return 0;
+}
+
+int send_msg(const struct user_t *receiver, const struct user_t *sender,
+             const char *msg, int flags)
+{
+    int  rv;
+    char resp[MAXDATASIZE];
+
+    snprintf(resp, MAXDATASIZE, "%s: %s", sender->name, msg);
+
+    rv = send(receiver->fd, resp, MSGLEN(resp), flags);
+
+    return rv;
+}
+
+/* Commands functions */
+int command_welcome(const struct user_t *user)
 {
     char resp[MAXDATASIZE];
-    strcpy(resp,
-           "Welcome to oss chat!\n"
-           "There are %d available rooms.\n"
-           "To see list of available command type '!help'.\n"
-           "To see this message again type '!welcome'.\n");
+    snprintf(resp, MAXDATASIZE,
+            "Welcome to oss chat!\n"
+            "There are %d available rooms.\n"
+            "To see list of available commands type '%s'.\n"
+            "To see this message again type '%s'.\n",
+            NROOMS, commands[CMDHELP], commands[CMDWLCM]);
 
+    send_msg(user, listener, resp, 0);
 
-    send(user->fd, resp, strlen(resp), 0);
+    return 0;
+}
+
+int command_list(const struct user_t *user)
+{
+    char resp[MAXDATASIZE];
+    snprintf(resp, MAXDATASIZE, "The list of available rooms:\n");
+    for (int i = 0; i < NROOMS; ++i)
+        snprintf(resp, MAXDATASIZE, "%sRoom %d - '%s' (%d/%d)\n",
+                 resp, i+1, rooms[i].name, rooms[i].top, rooms[i].max);
+
+    send_msg(user, listener, resp, 0);
+
+    return 0;
+}
+
+int command_help(const struct user_t *user)
+{
+    char resp[MAXDATASIZE];
+    strcpy(resp, "The list of available commands:\n");
+    for (int i = 0; i < NCMD; ++i) {
+        switch (i) {
+        case CMDWLCM:
+            snprintf(resp, MAXDATASIZE, "%s%s - prints server welcome message.\n",
+                     resp, commands[i]);
+            break;
+
+        case CMDNICK:
+            snprintf(resp, MAXDATASIZE, "%s%s <newnick> - sets <newnick> to user.\n",
+                     resp, commands[i]);
+            break;
+
+        case CMDROOM:
+            snprintf(resp, MAXDATASIZE, "%s%s <name_or_number> - enters user to "
+                     "<name_or_number> room.\n", resp, commands[i]);
+            break;
+
+        case CMDLIST:
+            snprintf(resp, MAXDATASIZE, "%s%s - prints list of available rooms.\n",
+                     resp, commands[i]);
+            break;
+
+        case CMDHELP:
+            snprintf(resp, MAXDATASIZE, "%s%s - prints this message.\n",
+                     resp, commands[i]);
+            break;
+
+        default: break;
+        }
+    }
+
+    send_msg(user, listener, resp, 0);
 
     return 0;
 }
@@ -233,194 +356,167 @@ int command_nick(struct user_t *user, const char *newnick)
     if (strlen(newnick) > strlen(user->name)) {
         char *buf = realloc(user->name, strlen(newnick) + 1);
         if (buf == NULL)
-            return 1;
+            return 1; // not enough memory
+
         strcpy(buf, newnick);
         user->name = buf;
     } else
         strcpy(user->name, newnick);
 
-    strcpy(resp, "Nickname was successfully changed.\n");
-    send(user->fd, resp, strlen(resp), 0);
+    snprintf(resp, MAXDATASIZE, "Nickname was successfully changed.\n");
+    send_msg(user, listener, resp, 0);
 
     return 0;
 }
 
 int command_room(struct user_t *user, const char *newroom)
 {
-
-}
-
-int command_help(struct user_t *user)
-{
     char resp[MAXDATASIZE];
-    strcpy(resp, "The list of available commands:\n");
-    for (int i = 0; i < NCMD; ++i) {
-        switch (i) {
-        case CMDWLCM:
-            sprintf(resp, "%s'%s' - prints server's welocme message.\n",
-                    resp, commands[CMDWLCM]);
+    bool is_error  = false;
+    int  roomi;
+
+    for (roomi = 0; roomi < NROOMS; ++roomi) {
+        if (strcmp(rooms[roomi].name, newroom) == 0)
             break;
 
-        case CMDNICK:
-            sprintf(resp, "%s'%s newnick' - sets 'newnick' to user.\n",
-                    resp, commands[CMDNICK]);
-            break;
-
-        case CMDHELP:
-            sprintf(resp, "%s'%s' - prints list of available commands and their syntax.\n",
-                    resp, commands[CMDHELP]);
-            break;
-
-        default: break;
+        if (roomi == NROOMS-1) {
+            is_error = true;
+            snprintf(resp, MAXDATASIZE,"Incorrect name of room, type '%s' "
+                     "to see list of available rooms.\n", commands[CMDLIST]);
         }
     }
 
-    send(user->fd, resp, strlen(resp), 0);
+    if (!is_error) {
+        if (change_room(&rooms[roomi], user) == -1) {
+            snprintf(resp, MAXDATASIZE, "Can't change room.\n");
+        } else {
+            snprintf(resp, MAXDATASIZE, "Welcome to room '%s'!\n",
+                    rooms[roomi].name);
+        }
+    }
 
-    return 0;
+    send_msg(user, listener, resp, 0);
+
+    return (is_error) ? 1 : 0;
 }
 
-int handle_message(struct user_t *user, const char *msg)
+int handle_command(struct user_t *user, char *msg)
 {
-    if (strlen(msg) <= 0) // is empty
-        return -1;
+    int  rv;
+    char resp[MAXDATASIZE], next_op[100];
 
-    int  i, rv; // rv for checking result of scanf
-    int  cmd = NOTCMD;
+    int cmd = NOTCMD;
+    const char *fmt = "%100s";
+    char *p = (char *) msg;
 
-    char next_op[MAXDATASIZE];
-    char *p, *err_msg;
+    rv = sscanf(msg, fmt, next_op);
+    p += strlen(next_op);
 
-    if (msg[0] == '!') { // is message a command
-        rv = sscanf(msg, "%100s", next_op);
-        p = msg + strlen(next_op); // get position after command
-
-        for (i = 0; i < NCMD; ++i)
-            if (strcmp(next_op, commands[i]) == 0) {
-                cmd = i;
-                break;
-            }
-    }
-
-    if (user->room != serv_room) {
-        switch (cmd) {
-        case NOTCMD:
-            for(i = 0; i < user->room->top; ++i)
-                if (send(user->room->users[i]->fd, msg, strlen(msg), 0) == -1)
-                    perror("send");
-
+    for (int i = 0; i < NCMD; ++i)
+        if (strcmp(next_op, commands[i]) == 0) {
+            cmd = i;
             break;
-
-        case CMDWLCM:
-            command_welcome(user);
-            break;
-
-        case CMDNICK:
-            rv = sscanf(p, "%100s", next_op);
-            if (rv < 1 || rv == EOF) {
-                err_msg = "Missed argument: 'newnick'.\n";
-                send(user->fd, err_msg, strlen(err_msg), 0);
-            } else {
-                command_nick(user, next_op);
-            }
-
-            break;
-
-        case CMDHELP:
-            command_help(user);
-            break;
-
-        default: break;
         }
+
+    switch (cmd) {
+    case CMDWLCM:
+        command_welcome(user);
+        break;
+
+    case CMDLIST:
+        command_list(user);
+        break;
+
+    case CMDHELP:
+        command_help(user);
+        break;
+
+    case CMDNICK:
+        rv = sscanf(p, fmt, next_op);
+        if (rv < 1 || rv == EOF) {
+            snprintf(resp, MAXDATASIZE, "Incorrect syntax, type '%s' to see syntax of commands.\n",
+                    commands[CMDHELP]);
+            send_msg(user, listener, resp, 0);
+        } else {
+            command_nick(user, next_op);
+        }
+
+        break;
+
+    case CMDROOM:
+        rv = sscanf(p, fmt, next_op);
+        if (rv < 1 || rv == EOF) {
+            snprintf(resp, MAXDATASIZE, "Incorrect syntax, type '%s' to see syntax of commands.\n",
+                    commands[CMDHELP]);
+            send_msg(user, listener, resp, 0);
+        } else {
+            command_room(user, next_op);
+        }
+
+        break;
+
+    default:
+        break;
     }
 
     return cmd;
 }
 
-void init_server(void)
+int handle_message(struct user_t *user, char *msg)
 {
+    char resp[MAXDATASIZE];
+    int rv = NOTCMD;
 
-}
+    if (msg[0] == '!') // is message a command
+        rv = handle_command(user, msg);
 
-void main_loop(void)
-{
-
-
-    // keep track of the static fd_set master;               // master file descriptor setbiggest file descriptor
-
-
-    int i, j, rv;
-    struct user_t *p;
-    for (;;) {
-
-
-        // run through the existing connections looking for data to read
-        for(i = 0; i < serv_room.top; ++i) {
-            p = serv_room.users[i];
-
-            if (FD_ISSET(p->fd, &read_fds)) {
-                if (p->fd == listener->fd) {
-                    // handle new connections
-                    newfd = accept_con(p->fd);
-
-                    if (newfd > -1) {
-                        FD_SET(newfd, &master); // add to master set
-                        if (newfd > fdmax) {    // keep track of the max
-                            fdmax = newfd;
-                        }
-
-                        add_user(&serv_room, new_user(newfd));
-                    }
-                } else {
-                    // handle data from a client
-                    if ((nbytes = recv(p->fd, buf, sizeof(buf), 0)) <= 0)
-                        close_con(p, nbytes);
-                    else
-                        handle_message(p, buf);
-                }
-            }
+    if (rv == NOTCMD) {
+        if (user->room != &serv_room) {
+            send_to_room(user, msg);
+        } else {
+            snprintf(resp, MAXDATASIZE,
+                    "You need to enter the room to send messages. "
+                    "Input the '%s' command to see list of available rooms.\n",
+                    commands[CMDLIST]);
+            send_msg(user, listener, resp, 0);
         }
     }
+    return rv;
 }
 
-void end_server(void)
-{int
-    for (int i = 1; i < serv_room.top; ++i) {
-        close(serv_room.users[i]->fd);
-        free(serv_room.users[i]);
-    }
-}
-
-int main(void)
+int main(int argc, char *argv[])
 {
-    /* Variables */
+    (void) argc; (void) argv;
+
     fd_set master;    // master file descriptor set
     fd_set read_fds;  // temp file descriptor list for select()
     int    fdmax;     // maximum file descriptor number
     int    newfd;     // newly accept()ed socket descriptor
 
-    char msg[MAXDATASIZE]; // buffer for server data
     char buf[MAXDATASIZE]; // buffer for client data
     int  nbytes;           // count of sent bytes
 
-    int i, j;
+    int i;
     struct user_t *p;
 
+
     /* Initialization */
-    serv_room->top = 0;
-    serv_room->max = MAXUSERS;
-    serv_room->users = malloc(sizeof(*serv_room->users) * serv_room->max);
-    assert(serv_room->users != NULL);
+    serv_room.top = 0;
+    serv_room.max = MAXUSERS;
+    serv_room.users = malloc(sizeof(*serv_room.users) * serv_room.max);
+    assert(serv_room.users != NULL);
 
     listener = new_user(get_serv_socket());
     assert(listener != NULL);
     listener->name = strdup("server");
     assert(listener->name != NULL);
-    add_user(serv_room, listener);
+    add_user(&serv_room, listener);
 
-    for (i = USERROOMI; i < NROOMS; ++i) { // init rooms
+    for (i = 0; i < NROOMS; ++i) { // init rooms
         rooms[i].max    = ROOMUSERS;
         rooms[i].top    = 0;
+        rooms[i].name   = strdup(room_names[i]);
+        assert(rooms[i].name != NULL);
         rooms[i].users  = malloc(sizeof(*rooms[i].users) * rooms[i].max);
         assert(rooms[i].users != NULL);
     }
@@ -440,11 +536,42 @@ int main(void)
             exit(4);
         }
 
-        for (i = 0; i < serv_room->top; ++i)
+        for (i = 0; i < serv_room.top; ++i) {
+            p = serv_room.users[i];
+
+            if (FD_ISSET(p->fd, &read_fds)) {
+                if (p->fd == listener->fd) {
+                    newfd = accept_con(listener->fd);
+                    if (newfd > -1) {
+                        FD_SET(newfd, &master);
+                        if (newfd > fdmax)
+                            fdmax = newfd;
+                    }
+                } else {
+                    if ((nbytes = recv(p->fd, buf, MAXDATASIZE-1, 0)) <= 0) {
+                        FD_CLR(p->fd, &master);
+                        close_con(p, nbytes);
+                    } else {
+                        buf[nbytes] = '\0';
+                        handle_message(p, buf);
+                    }
+                }
+            }
+        }
     }
 
+    for (i = 0; i < NROOMS; ++i)
+        free(rooms[i].name);
 
-    main_loop();
-    end_server();
+    for (i = 0; i < serv_room.top; ++i) {
+        close(serv_room.users[i]->fd);
+        free(serv_room.users[i]->name);
+        free(serv_room.users[i]);
+    }
+
+    free(listener->name);
+    free(listener);
+    free(serv_room.name);
+
     return 0;
 }
